@@ -8,30 +8,34 @@ BASE_URL = "https://api.jolpi.ca/ergast/f1"
 OUTPUT_DIR = "f1_data"
 os.makedirs(OUTPUT_DIR, exist_ok=True)
 BATCH_SIZE = 1000
-REQUEST_TIMEOUT = 60  # Increased timeout
-RETRIES = 5  # Retry on failure
-DELAY = 2  # Delay between requests in seconds
+REQUEST_TIMEOUT = 60
+RETRIES = 5
+DELAY = 2  # seconds between requests
 
 # -----------------------------
 # UTILITIES
 # -----------------------------
 def safe_get_json(url, retries=RETRIES):
-    """GET request with retries and timeout"""
+    """GET request with retries and basic 429 handling"""
+    wait = DELAY
     for i in range(retries):
         try:
             r = requests.get(url, timeout=REQUEST_TIMEOUT)
             if r.status_code == 200:
                 return r.json()
+            elif r.status_code == 429:
+                print(f"⚠️ HTTP 429 for {url}, backing off {wait}s...")
+                time.sleep(wait)
+                wait *= 2  # exponential backoff
             else:
                 print(f"⚠️ HTTP {r.status_code} for {url}")
         except Exception as e:
             print(f"⚠️ Error fetching {url} (attempt {i+1}/{retries}): {e}")
-        time.sleep(2)
+        time.sleep(wait)
     return None
 
 
 def flatten(df):
-    """Flatten nested column names for CSV"""
     df.columns = [
         c.replace(".", "_").replace("Driver_", "driver_")
          .replace("Constructor_", "constructor_")
@@ -44,7 +48,6 @@ def flatten(df):
 
 
 def save_csv(df, name):
-    """Save DataFrame to CSV"""
     if not df.empty:
         path = os.path.join(OUTPUT_DIR, f"{name}.csv")
         df.to_csv(path, index=False, encoding="utf-8-sig")
@@ -57,7 +60,6 @@ def save_csv(df, name):
 # BASIC ENDPOINTS
 # -----------------------------
 def fetch_paginated(url, key_path):
-    """Fetch paginated data for simple endpoints like seasons/drivers/etc"""
     offset = 0
     all_data = []
     while True:
@@ -96,17 +98,14 @@ def fetch_all_circuits():
 # PER-SEASON / PER-ROUND DATASETS
 # -----------------------------
 def get_races_for_season(year):
-    """Get all races for a season"""
     url = f"{BASE_URL}/{year}.json"
     data = safe_get_json(url)
     if not data:
         return []
-    races = data.get("MRData", {}).get("RaceTable", {}).get("Races", [])
-    return races
+    return data.get("MRData", {}).get("RaceTable", {}).get("Races", [])
 
 
 def fetch_race_data(year, dataset):
-    """Fetch dataset for all rounds in a season"""
     races = get_races_for_season(year)
     all_rows = []
 
@@ -114,8 +113,6 @@ def fetch_race_data(year, dataset):
         round_num = race.get("round")
         race_name = race.get("raceName")
         date = race.get("date")
-
-        # Round-specific endpoint
         url = f"{BASE_URL}/{year}/{round_num}/{dataset}.json"
         data = safe_get_json(url)
         if not data:
@@ -134,8 +131,6 @@ def fetch_race_data(year, dataset):
                 "circuit_location": r.get("Circuit", {}).get("Location", {}).get("locality"),
                 "circuit_country": r.get("Circuit", {}).get("Location", {}).get("country"),
             }
-
-            # Flatten nested keys
             nested_keys = ["Results", "QualifyingResults", "SprintResults", "PitStops", "Laps"]
             for key in nested_keys:
                 if key in r:
@@ -145,18 +140,51 @@ def fetch_race_data(year, dataset):
                         for k, v in race_meta.items():
                             flat[k] = v
                         all_rows.append(flat)
-        time.sleep(DELAY)  # delay between rounds
+        time.sleep(DELAY)
 
     if not all_rows:
         return pd.DataFrame()
     return pd.concat(all_rows, ignore_index=True)
 
 
-def fetch_all_years(dataset, start_year=2024, end_year=2025):
-    """Fetch a dataset for all seasons"""
+def fetch_standings_per_round(year, dataset):
+    """Fetch DriverStandings or ConstructorStandings for every round of the season"""
+    races = get_races_for_season(year)
+    if not races:
+        return pd.DataFrame()
+    all_rows = []
+
+    for race in races:
+        round_num = race["round"]
+        url = f"{BASE_URL}/{year}/{round_num}/{dataset}.json"
+        data = safe_get_json(url)
+        if not data:
+            print(f"⚠️ Skipping {dataset} for {year} round {round_num}")
+            continue
+
+        standings_list = data.get("MRData", {}).get("StandingsTable", {}).get("StandingsLists", [])
+        key_name = "DriverStandings" if dataset == "driverStandings" else "ConstructorStandings"
+        for s in standings_list:
+            for item in s.get(key_name, []):
+                flat = pd.json_normalize(item)
+                flat = flatten(flat)
+                flat["season"] = year
+                flat["round"] = round_num
+                all_rows.append(flat)
+        time.sleep(DELAY)
+
+    if not all_rows:
+        return pd.DataFrame()
+    return pd.concat(all_rows, ignore_index=True)
+
+
+def fetch_all_years(dataset, start_year=2024, end_year=2024):
     all_data = []
     for year in tqdm(range(start_year, end_year + 1), desc=f"Fetching {dataset}"):
-        df = fetch_race_data(year, dataset)
+        if dataset in ["driverStandings", "constructorStandings"]:
+            df = fetch_standings_per_round(year, dataset)
+        else:
+            df = fetch_race_data(year, dataset)
         if not df.empty:
             all_data.append(df)
     if all_data:
@@ -168,7 +196,7 @@ def fetch_all_years(dataset, start_year=2024, end_year=2025):
 # MAIN PIPELINE
 # -----------------------------
 def main():
-    print("🏎️ Fetching complete F1 dataset by season...\n")
+    print("🏎️ Fetching complete F1 dataset by season (per round standings included)...\n")
 
     datasets = {
         "Seasons": fetch_all_seasons(),
